@@ -1,0 +1,8 @@
+.Rhistory
+.RData
+.Rproj.user/
+data/raw/*.csv
+data/processed/*.csv
+*.html
+!README.html
+Rplots.pdf

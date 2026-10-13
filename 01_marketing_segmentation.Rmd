@@ -1,0 +1,281 @@
+---
+title: "Customer Segmentation for Marketing"
+author: "Segmentation project"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: readable
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5)
+for (file in c("data.R", "features.R", "clustering.R", "models.R")) {
+  source(file.path("R", file))
+}
+if (!requireNamespace("ggplot2", quietly = TRUE)) {
+  stop("Install ggplot2 before knitting this workbook.")
+}
+library(ggplot2)
+set.seed(42)
+```
+
+## Goal
+
+Split a mock retail customer base into groups with distinct behaviours, explain
+what distinguishes them, and use their estimated response propensity to target a
+promotional campaign. The simulated customers are drawn from five hidden
+personas; those labels are used only to evaluate clustering, never as model
+inputs.
+
+## 1. Data overview
+
+```{r data}
+customers <- load_customers()
+dim(customers)
+head(customers)
+summary(customers[c("age", "income_k", "tenure_months", "recency_days",
+                    "frequency_12m", "monetary_12m", "nps_score")])
+```
+
+Each row is one customer. Campaign response and subsequent six-month churn are
+binary outcomes. The persona label is retained for validation.
+
+```{r overview}
+persona_summary <- aggregate(
+  cbind(frequency_12m, monetary_12m, recency_days, responded_campaign,
+        churned_6m) ~ true_persona,
+  data = customers, FUN = mean
+)
+persona_summary
+```
+
+## 2. Baseline: RFM segmentation
+
+Recency, frequency, and monetary value are independently scored from 1 to 5.
+The recency score is reversed so 5 means a more recent purchase.
+
+```{r rfm}
+rfm <- rfm_scores(customers)
+customers <- cbind(customers, rfm)
+as.data.frame(table(customers$rfm_segment))
+```
+
+RFM is transparent, but it omits channel engagement, discount preference, and
+other behavioural differences.
+
+## 3. Behavioural clustering
+
+The clustering inputs describe what customers do, not their demographics.
+Right-skewed measures are transformed with `log1p`; all eight inputs are then
+standardised.
+
+```{r transform}
+x <- cluster_preprocessor(customers)
+dim(x)
+```
+
+### Choosing the number of segments
+
+The elbow, silhouette, bootstrap stability (mean pairwise adjusted Rand index),
+and Gaussian-mixture BIC give complementary views of candidate values of *k*.
+Silhouette is calculated on a reproducible sample to keep the distance
+calculation practical for the full customer set.
+
+```{r select-k, cache=TRUE}
+k_range <- 2:10
+k_scores <- evaluate_k(x, k_range)
+stability <- stability_by_k(x, k_range, n_boot = 10, frac = 0.8)
+bic <- gmm_bic(x, k_range)
+selection <- data.frame(
+  k = k_range,
+  inertia = k_scores$inertia,
+  silhouette = k_scores$silhouette,
+  stability = unname(stability),
+  gmm_bic = unname(bic)
+)
+selection
+```
+
+```{r selection-plot}
+selection_long <- rbind(
+  data.frame(k = k_range, measure = "Silhouette", value = selection$silhouette),
+  data.frame(k = k_range, measure = "Bootstrap stability", value = selection$stability)
+)
+ggplot(selection_long, aes(k, value)) +
+  geom_line(colour = "#2a78d6") + geom_point(colour = "#2a78d6") +
+  facet_wrap(~measure, scales = "free_y") +
+  labs(title = "Cluster separation and reproducibility", x = "Number of clusters (k)",
+       y = "Score") +
+  theme_minimal()
+```
+
+The elbow and GMM BIC have different scales, so they are reported as tables
+rather than combined on one axis. The example proceeds with five segments, the
+known number of simulated personas.
+
+### Compare clustering algorithms
+
+```{r compare, cache=TRUE}
+k <- 5
+comparison <- compare_algorithms(x, k, truth = customers$true_persona)
+comparison$scores
+customers$cluster <- comparison$labels[["K-Means"]]
+```
+
+### Segment profiles and names
+
+Business archetypes encode expected high/low directions for a handful of
+profile features. The Hungarian assignment matches each cluster to at most one
+archetype.
+
+```{r profiles}
+profile <- index_vs_average(customers, "cluster", PROFILE_FEATURES)
+segment_names <- name_segments(profile)
+customers$segment <- unname(segment_names[as.character(customers$cluster)])
+profile_named <- data.frame(
+  cluster = rownames(profile),
+  segment = unname(segment_names[rownames(profile)]),
+  profile,
+  row.names = NULL,
+  check.names = FALSE
+)
+profile_named
+```
+
+```{r profile-heatmap, fig.height=6}
+profile_long <- data.frame(
+  cluster = rep(rownames(profile), times = ncol(profile)),
+  feature = rep(colnames(profile), each = nrow(profile)),
+  z_score = as.vector(profile)
+)
+profile_long$segment <- segment_names[profile_long$cluster]
+ggplot(profile_long, aes(feature, segment, fill = z_score)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "#184f95", mid = "#f0efec", high = "#b52f2f") +
+  labs(title = "Segment profile relative to the customer average",
+       x = NULL, y = NULL, fill = "z-score") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1))
+```
+
+### Segment map and validation
+
+```{r pca, fig.height=4}
+pc <- stats::prcomp(x, center = FALSE, scale. = FALSE)
+map <- data.frame(PC1 = pc$x[, 1], PC2 = pc$x[, 2],
+                  segment = customers$segment)
+ggplot(map, aes(PC1, PC2, colour = segment)) +
+  geom_point(alpha = 0.45, size = 0.8) +
+  labs(title = "Customer segments projected onto the first two PCs",
+       colour = "Segment") +
+  theme_minimal()
+```
+
+```{r validation}
+persona_by_segment <- prop.table(table(customers$true_persona, customers$segment), 1)
+round(persona_by_segment, 2)
+
+rfm_by_segment <- prop.table(table(customers$rfm_segment, customers$segment), 2)
+round(rfm_by_segment, 2)
+
+adjusted_rand(customers$true_persona, customers$cluster)
+```
+
+The persona cross-tabulation measures recovery of the simulated source groups.
+The RFM cross-tabulation shows how behavioural groups cut across a simpler
+rule-based segmentation.
+
+## 4. Explain segments with a random forest
+
+This supervised model predicts the already-assigned behavioural segment from
+all customer attributes. A held-out classification report measures how well a
+future customer can be assigned, while permutation importance indicates which
+attributes help distinguish the segments.
+
+```{r explain, cache=TRUE}
+segment_fit <- train_segment_classifier(customers)
+segment_fit$report
+head(segment_fit$importance, 15)
+```
+
+## 5. Campaign response modelling
+
+Compare a logistic-regression baseline with gradient boosting on a stratified
+30% hold-out set. Both models include segment membership as a predictor.
+
+```{r response, cache=TRUE}
+response_fit <- train_response_models(customers)
+auc <- vapply(response_fit$results, `[[`, numeric(1), "auc")
+auc
+```
+
+```{r roc}
+roc_data <- do.call(rbind, lapply(names(response_fit$results), function(name) {
+  result <- response_fit$results[[name]]
+  data.frame(fpr = result$fpr, tpr = result$tpr, model = name)
+}))
+ggplot(roc_data, aes(fpr, tpr, colour = model)) +
+  geom_line() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  coord_equal() +
+  labs(title = "Campaign response ROC curves", x = "False positive rate",
+       y = "True positive rate", colour = "Model") +
+  theme_minimal()
+```
+
+Decile lift ranks customers by the selected model's predicted probability.
+
+```{r gains}
+best_name <- names(auc)[which.max(auc)]
+best_scores <- response_fit$results[[best_name]]$scores
+gains <- gains_table(response_fit$y_test, best_scores)
+best_name
+gains
+```
+
+## 6. Marketing playbook
+
+```{r playbook}
+response_predictions <- predict_response(response_fit, customers)
+customers$p_response <- response_predictions[[best_name]]
+
+actions <- c(
+  "Loyal High-Value" = "VIP / loyalty tier, early access, and referrals; protect margin",
+  "Bargain Hunters" = "Targeted promo codes and bundles; cap discount depth",
+  "Digital Natives" = "App push and social campaigns; use mobile-first offers",
+  "Occasional Big Spenders" = "Personalised premium recommendations around purchase cycles",
+  "At-Risk Lapsed" = "Low-cost win-back sequence; suppress costly channels if inactive"
+)
+playbook <- aggregate(
+  cbind(monetary_12m, responded_campaign, p_response, churned_6m) ~ segment,
+  data = customers, FUN = mean
+)
+counts <- as.data.frame(table(customers$segment), stringsAsFactors = FALSE)
+names(counts) <- c("segment", "customers")
+revenue <- aggregate(monetary_12m ~ segment, customers, sum)
+names(revenue)[[2]] <- "revenue"
+playbook <- merge(playbook, counts, by = "segment")
+playbook <- merge(playbook, revenue, by = "segment")
+playbook$revenue_share <- playbook$revenue / sum(playbook$revenue)
+playbook$action <- unname(actions[playbook$segment])
+playbook[order(-playbook$revenue_share), ]
+```
+
+```{r export}
+output <- customers[c("customer_id", "segment", "rfm_segment", "R", "F", "M",
+                      "p_response")]
+dir.create(file.path("data", "processed"), recursive = TRUE, showWarnings = FALSE)
+utils::write.csv(output, file.path("data", "processed", "customer_segments.csv"),
+                 row.names = FALSE)
+message("Saved ", nrow(output), " scored customers to data/processed/customer_segments.csv")
+```
+
+## Interpretation
+
+Use the resulting cluster scores, profiles, and hold-out metrics to decide
+whether the simulated groups are useful. For real customer data, validate
+stability over time, test segment-specific offers, and prefer uplift modelling
+when the goal is to estimate incremental campaign impact.
